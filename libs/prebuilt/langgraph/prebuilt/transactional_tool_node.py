@@ -147,3 +147,82 @@ class TransactionalToolNode(ToolNode):
         seq = self.journal.generate_rollback_sequence()
         self.journal.clear()
         return seq
+
+    def _run_one(
+        self,
+        call: Any,
+        input_type: Any,
+        tool_runtime: Any,
+    ) -> Any:
+        """In-line interceptor hooking validate_action into the synchronous execution path."""
+        tool_name = call.get("name", "")
+        args = call.get("args", {})
+        if isinstance(args, str):
+            import json
+            try:
+                args = json.loads(args)
+            except Exception:
+                args = {"raw": args}
+
+        # Enforce in-flight safety invariants prior to dispatch
+        try:
+            self.validate_action(tool_name, args)
+        except (DestructiveActionBlockedError, BlastRadiusExceededError) as breach:
+            self.rollback_all()
+            if self._handle_tool_errors:
+                from langchain_core.messages import ToolMessage
+                return ToolMessage(
+                    content=f"BLOCKED: {breach}. Transaction rolled back.",
+                    name=tool_name,
+                    tool_call_id=call.get("id", "call_blocked"),
+                    status="error",
+                )
+            raise breach
+
+        try:
+            res = super()._run_one(call, input_type, tool_runtime)
+            target = args.get("target_id") or args.get("node_id") or "default"
+            self.record_mutation(tool_name, str(target), args)
+            return res
+        except Exception:
+            self.rollback_all()
+            raise
+
+    async def _run_one_async(
+        self,
+        call: Any,
+        input_type: Any,
+        tool_runtime: Any,
+    ) -> Any:
+        """In-line interceptor hooking validate_action into the asynchronous execution path."""
+        tool_name = call.get("name", "")
+        args = call.get("args", {})
+        if isinstance(args, str):
+            import json
+            try:
+                args = json.loads(args)
+            except Exception:
+                args = {"raw": args}
+
+        try:
+            self.validate_action(tool_name, args)
+        except (DestructiveActionBlockedError, BlastRadiusExceededError) as breach:
+            self.rollback_all()
+            if self._handle_tool_errors:
+                from langchain_core.messages import ToolMessage
+                return ToolMessage(
+                    content=f"BLOCKED: {breach}. Transaction rolled back.",
+                    name=tool_name,
+                    tool_call_id=call.get("id", "call_blocked"),
+                    status="error",
+                )
+            raise breach
+
+        try:
+            res = await super()._run_one_async(call, input_type, tool_runtime)
+            target = args.get("target_id") or args.get("node_id") or "default"
+            self.record_mutation(tool_name, str(target), args)
+            return res
+        except Exception:
+            self.rollback_all()
+            raise
